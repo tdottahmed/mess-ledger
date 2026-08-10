@@ -1,7 +1,8 @@
 # Free Deployment & PWA Plan
 
 Companion to [PLAN.md](./PLAN.md). How Mess Ledger gets onto three phones at ৳0/month, and what
-makes it a real installable app rather than a website.
+makes it a real installable app rather than a website. The accounts this assumes you already have
+are listed in [ACCOUNTS.md](./ACCOUNTS.md).
 
 **Plan v1 — 10 August 2026.** Free-tier numbers below were verified against Cloudflare docs on this
 date. Re-check before relying on any of them.
@@ -31,16 +32,21 @@ Headroom is three orders of magnitude on everything except CPU time.
 
 ### 1.2 The two limits that actually constrain the design
 
-**10 ms CPU per request.** Plenty for SQL and JSON, nowhere near enough to rasterise an image.
-This kills on-demand generation of the shared-link preview image from §8.3 of PLAN.md. Instead:
-**pre-generate the PNG when the month closes**, store it in R2, and have the share page reference it
-as a static URL. Generation happens once a month inside a request that has nothing else to do — and
-if it still overruns, generate it client-side on the closing device and upload it like any other
-attachment.
+**10 ms CPU per request.** Plenty for SQL and JSON, nowhere near enough to rasterise an image — and
+the cron handler gets the same 10 ms, so there is no server-side path, scheduled or on demand. This
+kills the shared-link preview image from §8.3 of PLAN.md as a Worker job entirely. Instead: **the
+closing device renders the PNG to a canvas at month close and uploads it to R2** like any other
+attachment, and the share page references it as a static URL. `ctx.waitUntil()` is not a way out —
+its 30 s is wall-clock, the CPU budget stays at 10 ms.
 
-**50 D1 queries per Worker invocation.** The sync endpoint touches eight tables. Never loop
-per-row — use `db.batch([...])` so a pull is a handful of statements regardless of how many rows
-come back.
+The same ceiling rules out bcrypt and scrypt for the PIN, which is why PLAN.md §5 stores an
+HMAC under a Worker-secret pepper instead.
+
+**50 D1 queries per Worker invocation.** A free-plan ceiling specifically — paid gets 1,000. The
+sync endpoint touches eight tables, so never loop per-row: `db.batch([...])` keeps a pull at eight
+statements regardless of how many rows come back. A batch still counts each statement toward the
+50, so the outbox flush is the endpoint actually at risk — **cap it at 40 mutations per request**
+and let the loop drain across several calls. A phone that was offline for a week will need this.
 
 ### 1.3 Shape: one Worker, not Pages + Worker
 
@@ -124,7 +130,8 @@ fell through to the SPA fallback, WhatsApp would get an empty shell and render n
 
 ### 1.6 Provisioning runbook
 
-Once, from the project root:
+Assumes the Cloudflare account, `workers.dev` subdomain and R2 activation from
+[ACCOUNTS.md](./ACCOUNTS.md) are already done. Then, once, from the project root:
 
 ```bash
 npm i -D wrangler drizzle-kit vite-plugin-pwa
@@ -187,9 +194,10 @@ easily be older than that. So:
 ### 1.10 CI/CD
 
 `.github/workflows/deploy.yml` — push to `main` runs typecheck, tests (both split invariants),
-migrations, then deploy via `cloudflare/wrangler-action`. Needs one repo secret,
-`CLOUDFLARE_API_TOKEN`, scoped to Workers Scripts + D1 + R2 edit. Free for a private repo within the
-2,000 Actions minutes/month; this pipeline is under a minute.
+migrations, then deploy via `cloudflare/wrangler-action`. Needs two repo secrets,
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` — see [ACCOUNTS.md §1.6 and §2.3](./ACCOUNTS.md)
+for the exact token scopes. Free for a private repo within the 2,000 Actions minutes/month; this
+pipeline is under a minute.
 
 Migrations run **before** deploy, so new code never meets an old schema.
 
@@ -378,12 +386,18 @@ PWA:
 
 ## Corrections to PLAN.md
 
-Two things verified today differ from the earlier estimate and are fixed in PLAN.md:
+Four things verified today differ from the earlier estimate and are fixed in PLAN.md:
 
 1. **D1 free storage is 500 MB per database** (5 GB per account), not 5 GB per database. Still ~50×
    more than this app will ever need.
-2. **The 10 ms CPU limit rules out on-demand preview-image generation.** Phase 03's shared-link image
-   becomes pre-generated at month close and stored in R2.
+2. **The 10 ms CPU limit rules out preview-image generation on the Worker altogether** — cron
+   handlers get the same 10 ms, so "pre-generate it on a schedule" was never an option either.
+   Phase 03's shared-link image is rendered on the closing device and uploaded to R2.
+3. **The same limit rules out bcrypt and scrypt**, which §5 had specified for the PIN. It now stores
+   `HMAC-SHA-256(pin, salt)` under a pepper kept in a Worker secret. For a 10,000-candidate PIN
+   space this costs nothing real; the lockout and the phone allowlist were always doing the work.
+4. **50 D1 queries per invocation is a free-plan ceiling** (paid gets 1,000), and batched statements
+   each count. §6's outbox flush is now capped at 40 mutations per request.
 
 ---
 
